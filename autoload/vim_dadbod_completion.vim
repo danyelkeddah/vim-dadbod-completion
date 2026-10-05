@@ -14,9 +14,14 @@ let s:mapped_reserved_words = map(copy(vim_dadbod_completion#reserved_keywords#g
       \ {'word': word, 'abbr': word, 'menu': s:mark, 'info': 'SQL reserved word', 'kind': 'R' }
       \ })
 
-function! vim_dadbod_completion#omni(findstart, base)
-  let line = getline('.')[0:col('.') - 2]
-  let current_char = getline('.')[col('.') - 2]
+" Optional SQL context is supplied by the Neovim injection-aware sources.
+" The two-argument omnifunc API remains usable in Vim without Lua.
+function! vim_dadbod_completion#omni(findstart, base, ...)
+  let context = a:0 ? a:1 : {}
+  let sql_line = get(context, 'line', getline('.'))
+  let sql_col = get(context, 'col', col('.') - 1)
+  let line = strpart(sql_line, 0, sql_col)
+  let current_char = sql_col > 0 ? strpart(sql_line, sql_col - 1, 1) : ''
   if a:findstart
     let trigger_char = match(line, s:trigger_rgx)
     if trigger_char > -1
@@ -26,23 +31,29 @@ function! vim_dadbod_completion#omni(findstart, base)
   endif
 
   let is_trigger_char = current_char =~? s:trigger_rgx
-  let bufnr = bufnr('%')
+  let bufnr = get(context, 'bufnr', bufnr('%'))
 
   if empty(a:base) && !is_trigger_char
     return []
   endif
 
-  if !has_key(s:buffers, bufnr)
-    call vim_dadbod_completion#fetch(bufnr(''))
+  if !has_key(s:buffers, bufnr) || !has_key(s:cache, get(s:buffers[bufnr], 'db', ''))
+    if get(context, 'embedded', 0)
+      call s:fetch(bufnr)
+    else
+      call vim_dadbod_completion#fetch(bufnr)
+    endif
   endif
 
   " Nothing found, returning empty
-  if !has_key(s:buffers, bufnr)
+  if !has_key(s:buffers, bufnr) || !has_key(s:cache, get(s:buffers[bufnr], 'db', ''))
     return []
   endif
 
   let buf = s:buffers[bufnr]
-  let s:buffers[bufnr].aliases = vim_dadbod_completion#alias_parser#parse(bufnr, s:cache[buf.db].tables_list)
+  let s:buffers[bufnr].aliases = has_key(context, 'lines')
+        \ ? vim_dadbod_completion#alias_parser#parse(bufnr, s:cache[buf.db].tables_list, context.lines)
+        \ : vim_dadbod_completion#alias_parser#parse(bufnr, s:cache[buf.db].tables_list)
 
   let table_scope_match = get(matchlist(line, s:table_scope_rgx), 2, '')
   let table_scope = s:get_scope(buf, table_scope_match, 'table')
@@ -61,8 +72,9 @@ function! vim_dadbod_completion#omni(findstart, base)
   let should_filter = !(empty(a:base) && is_trigger_char)
   let bind_params_match = match(line, '[[:blank:]]*:\w*$') > -1
 
-  if bind_params_match && exists('b:dbui_bind_params')
-    for [param_name, param_val] in items(b:dbui_bind_params)
+  let buffer_bind_params = getbufvar(bufnr, 'dbui_bind_params', {})
+  if bind_params_match && !empty(buffer_bind_params)
+    for [param_name, param_val] in items(buffer_bind_params)
       call add(bind_params, {
             \ 'word': param_name[1:],
             \ 'abbr': param_name,
@@ -135,7 +147,7 @@ function! vim_dadbod_completion#omni(findstart, base)
 
   let columns = columns[0:s:limit('columns')]
 
-  return s:quote_results(bind_params + reserved_words + schemas + tables + aliases + columns + functions)
+  return s:quote_results(bind_params + reserved_words + schemas + tables + aliases + columns + functions, bufnr, sql_line, sql_col + 1)
 endfunction
 
 function! s:map_item(type, info_val, kind, index, item) abort
@@ -161,6 +173,14 @@ function vim_dadbod_completion#clear_cache() abort
 endfunction
 
 function! vim_dadbod_completion#fetch(bufnr) abort
+  if index(s:filetypes, getbufvar(a:bufnr, '&filetype')) < 0 && empty(getbufvar(a:bufnr, 'dbui_db_key_name'))
+    return
+  endif
+  return s:fetch(a:bufnr)
+endfunction
+
+" Embedded completion reaches this only after resolving a SQL injection.
+function! s:fetch(bufnr) abort
   if !has('nvim') && !exists('*job_start')
     let s:buffers[a:bufnr] = {}
     return
@@ -173,9 +193,6 @@ function! vim_dadbod_completion#fetch(bufnr) abort
     let g:db_adapter_sqlite3 = 'db#adapter#sqlite#'
   endif
 
-  if index(s:filetypes, getbufvar(a:bufnr, '&filetype')) < 0 && empty(getbufvar(a:bufnr, 'dbui_db_key_name'))
-    return
-  endif
   let db_info = s:get_buffer_db_info(a:bufnr)
 
   return s:save_to_cache(a:bufnr, db_info.url, db_info.table, db_info.dbui)
@@ -394,7 +411,7 @@ function! s:get_buffer_db_info(bufnr) abort
   endif
 
   let db = $DATABASE_URL
-  for dict in [w:, t:, b:, g:]
+  for dict in [w:, t:, getbufvar(a:bufnr, ''), g:]
     if has_key(dict, 'db') && !empty(dict.db)
       let db = dict.db
       break
@@ -414,30 +431,32 @@ function! s:get_buffer_db_info(bufnr) abort
 endfunction
 
 function! s:quote(scheme, left_wrap, right_wrap, index, item) abort
-  if a:item.kind !=? 'F' && a:item.kind !=? 'R' && a:scheme.should_quote(a:item.abbr)
+  let kind = get(a:item, 'kind', '')
+  if kind !=? 'F' && kind !=? 'R' && a:scheme.should_quote(a:item.abbr)
     let a:item.word = a:left_wrap.a:item.abbr.a:right_wrap
   endif
   return a:item
 endfunction
 
-function! s:quote_results(results) abort
-  if !has_key(s:buffers, bufnr('%'))
+function! s:quote_results(results, bufnr, line, col) abort
+  if !has_key(s:buffers, a:bufnr)
     return a:results
   endif
-  let scheme = vim_dadbod_completion#schemas#get(s:buffers[bufnr('%')].scheme)
+  let scheme = vim_dadbod_completion#schemas#get(s:buffers[a:bufnr].scheme)
 
   if empty(scheme)
     return a:results
   endif
 
-  let line = getline('.')
+  let line = a:line
   let [l_quote, r_quote] = scheme.quote
   let l_quote_esc = escape(l_quote, '[')
   let r_quote_esc = escape(r_quote, ']')
-  let left_wrap = match(line, l_quote_esc.'\w*\%'.col('.').'c') > -1 ? '' : l_quote
-  let right_wrap = matchstr(line, '\%>'.(col('.') - 1).'c['.r_quote_esc.' \.]') !=? r_quote ? r_quote : ''
+  let left_wrap = match(line, l_quote_esc.'\w*\%'.a:col.'c') > -1 ? '' : l_quote
+  let right_wrap = matchstr(line, '\%>'.(a:col - 1).'c['.r_quote_esc.' \.]') !=? r_quote ? r_quote : ''
 
-  return map(a:results, function('s:quote', [scheme, left_wrap, right_wrap]))
+  " Quoting depends on this cursor; do not mutate shared cached items.
+  return map(deepcopy(a:results), function('s:quote', [scheme, left_wrap, right_wrap]))
 endfunction
 
 function! s:limit(type) abort

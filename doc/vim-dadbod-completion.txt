@@ -8,7 +8,8 @@ CONTENTS                                          *vim-dadbod-completion-content
     1.2. Features.................................|vim-dadbod-completion-features|
     1.3. How it works.........................|vim-dadbod-completion-how_it_works|
     1.4. Settings.................................|vim-dadbod-completion-settings|
-    1.5. Todo.........................................|vim-dadbod-completion-todo|
+    1.5. Embedded SQL.........................|vim-dadbod-completion-embedded|
+    1.6. Todo.........................................|vim-dadbod-completion-todo|
 
 ================================================================================
 VIM-DADBOD-COMPLETION                *vim-dadbod-completion-vim-dadbod-completion*
@@ -20,6 +21,8 @@ Supports:
 * completion-nvim (https://github.com/haorenW1025/completion-nvim)
 * nvim-compe (https://github.com/hrsh7th/nvim-compe)
 * ddc.vim (https://github.com/Shougo/ddc.vim)
+* nvim-cmp (https://github.com/hrsh7th/nvim-cmp)
+* blink.cmp (https://github.com/Saghen/blink.cmp)
 * Built in `omnifunc`
 
 
@@ -94,6 +97,147 @@ HOW IT WORKS                                  *vim-dadbod-completion-how_it_work
 
 *   If an sql buffer is created by vim-dadbod-ui (https://github.com/kristijanhusak/vim-dadbod-ui), it reads all the configuration from there. It should work out of the box.
 *   If `vim-dadbod-ui` is not used, vim-dadbod (https://github.com/tpope/vim-dadbod) environment variable `$DATABASE_URL` or `w:db`, `t:db`, `b:db`, `g:db` used, whichever is found first. If you want, you can also add `b:db_table` to limit autocompletions to that table only.
+
+--------------------------------------------------------------------------------
+EMBEDDED SQL                                    *vim-dadbod-completion-embedded*
+
+Blink and nvim-cmp support existing Tree-sitter SQL injections in any host
+language. Requires Neovim 0.10+ (tested on 0.10.4 and 0.12.2), compatible host and
+SQL parsers, and injection queries exposing sql, mysql, or plsql. Parsers and
+queries on 'runtimepath' are sufficient; nvim-treesitter itself is optional.
+Standalone sql/mysql/plsql completion still works in Vim without Lua/Tree-sitter.
+
+Injection queries identify SQL; Dadbod consumes those injections. Dadbod does not
+recognize annotations or install injection rules. Users or query packages must
+supply them. Missing parsers and unsupported positions disable the source safely.
+Incomplete SQL works if its injected region remains identifiable.
+
+LOADING AND SOURCES ~
+
+Do not restrict plugin loading to SQL filetypes. Load vim-dadbod and this plugin
+alongside your completion engine, including in host buffers. For lazy.nvim and
+Blink, merge this into your Blink specification:
+>lua
+    {
+      'saghen/blink.cmp',
+      version = '1.*',
+      dependencies = {
+        {
+          'kristijanhusak/vim-dadbod-completion',
+          dependencies = { 'tpope/vim-dadbod' },
+        },
+      },
+      opts = {
+        sources = {
+          default = { 'lsp', 'path', 'snippets', 'buffer', 'dadbod' },
+          providers = {
+            dadbod = {
+              name = 'Dadbod', module = 'vim_dadbod_completion.blink',
+            },
+          },
+        },
+      },
+    }
+<
+Also add dadbod to any host-specific sources.per_filetype overrides. Preserve
+normal host-language sources; Dadbod guards availability and completion requests.
+
+For nvim-cmp, load this plugin and vim-dadbod alongside cmp, not only on SQL
+FileType. The after/plugin script registers the source. Add it to the global
+source list and any host-specific overrides, preserving your other sources:
+>lua
+    local cmp = require('cmp')
+    cmp.setup({
+      sources = cmp.config.sources({
+        { name = 'nvim_lsp' },
+        { name = 'vim-dadbod-completion' },
+        { name = 'buffer' },
+        { name = 'path' },
+        -- Keep existing snippet/other sources too.
+      }),
+    })
+<
+If manual loading skipped automatic registration, register after loading cmp:
+>lua
+    cmp.register_source('vim-dadbod-completion',
+      require('vim_dadbod_completion').nvim_cmp_source)
+<
+Configure the database on the ORIGINAL host buffer, e.g. in a Go buffer:
+>
+    :let b:db = 'postgresql://user:pass@localhost:5432/db_name'
+<
+DBUI settings and the normal w:db, t:db, b:db, g:db, $DATABASE_URL precedence
+apply, as do b:db_table and buffer-local bind parameters. No filetype changes,
+scratch buffers, or synthetic DBUI variables are used. Metadata is fetched on
+completion requests, never availability checks, and cached by connection. Use
+:DBCompletionClearCache after schema changes.
+
+GO INJECTION EXAMPLE (OPT-IN) ~
+
+Install compatible go and sql parsers with your parser manager (e.g.
+:TSInstall go sql on nvim-treesitter versions providing that command). Create:
+
+    ~/.config/nvim/after/queries/go/injections.scm
+
+Or use stdpath('config') .. '/after/queries/go/injections.scm' with a custom config
+location. Exact contents follow. The first line extends existing queries rather
+than replacing them:
+>query
+    ; extends
+
+    ; Newer Go grammars wrap statements in statement_list; older ones do not.
+    ; Use a wildcard for that wrapper so both grammar versions accept this query.
+    ([
+      (block
+        (comment) @_sql
+        . (_
+            . (short_var_declaration
+                right: (expression_list
+                  (raw_string_literal (raw_string_literal_content) @injection.content)))))
+      ((comment) @_sql
+       . (short_var_declaration
+           right: (expression_list
+             (raw_string_literal (raw_string_literal_content) @injection.content))))
+     ]
+     (#eq? @_sql "// language=SQL")
+     (#set! injection.language "sql"))
+<
+Restart Neovim, open a Go file, and put this declaration inside a function:
+>go
+    // language=SQL
+    query := `
+        SELECT p.id, p.name
+        FROM products AS p
+        WHERE p.id = $1
+    `
+<
+The comment must directly precede the short declaration. Only the intended raw
+string's content is injected, excluding backticks. This annotation is a convention
+recognized by this example query, NOT a universal Tree-sitter directive or Dadbod
+marker. Tests use real Go parsers (v0.23.4 and newer statement_list layouts).
+
+Set b:db, then type p. inside the string for products columns or pro after FROM
+for table names. Request completion with <C-Space> using Blink's default keymap.
+Dadbod stays inactive outside recognized SQL; Go completion sources remain.
+
+LIMITATIONS ~
+
+- Aliases, prefixes, quoting and edits are scoped to the active SQL region.
+  Connection settings remain on the original host buffer.
+- Only one contiguous included range per SQL tree is supported. Multi-range
+  combined/disjoint injections are rejected, not concatenated. Excluded host
+  content is not scanned. Queries must exclude host delimiters accurately.
+- Cursor insertion points immediately after opening/before closing delimiters
+  are inside; before opening/after closing delimiters are outside.
+- Dynamically concatenated/interpolated strings and function calls are not
+  reconstructed. Severely broken host syntax may lose its injection entirely.
+- Items are SQL text; host-language string escaping is not performed. Choose
+  string delimiters that do not conflict with database identifier quotes.
+- Alias parsing remains lightweight and line-based, not a full SQL parser.
+- Embedded support is for Blink and nvim-cmp. Legacy adapters and the public
+  two-argument omnifunc keep their standalone behavior.
+
+See tests/README.md in the repository for the headless real-parser harness.
 
 --------------------------------------------------------------------------------
 SETTINGS                                          *vim-dadbod-completion-settings*

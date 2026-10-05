@@ -15,6 +15,7 @@ M.complete_item = {
 }
 
 local nvim_cmp_source = {}
+local context = require('vim_dadbod_completion.context')
 
 ---Source constructor.
 nvim_cmp_source.new = function()
@@ -27,7 +28,11 @@ nvim_cmp_source.get_debug_name = function()
 end
 
 function nvim_cmp_source:is_available()
-  return true
+  return context.resolve() ~= nil
+end
+
+function nvim_cmp_source:get_position_encoding_kind()
+  return 'utf-8'
 end
 
 function nvim_cmp_source:get_trigger_characters(_)
@@ -44,14 +49,20 @@ local map_kind_to_cmp_lsp_kind = {
 }
 
 function nvim_cmp_source:complete(params, callback)
-  local input = string.sub(params.context.cursor_before_line, params.offset)
-  local results = vim.fn['vim_dadbod_completion#omni'](0, input)
+  local cursor = { params.context.cursor.row, params.context.cursor.col - 1 }
+  local sql = context.resolve(params.context.bufnr, cursor)
+  if not sql then
+    callback({ items = {}, isIncomplete = true })
+    return
+  end
+  local results, range = context.complete(sql, cursor)
   local items = {}
   for _, item in ipairs(results) do
     table.insert(items, {
       label = item.abbr,
       dup = 0,
       insertText = item.word,
+      textEdit = { newText = item.word, range = range },
       labelDetails = {
         description = item.menu,
       },

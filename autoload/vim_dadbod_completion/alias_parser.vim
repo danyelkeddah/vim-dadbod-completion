@@ -1,7 +1,7 @@
 let s:reserved_words = ['inner', 'outer', 'left', 'right', 'join', 'where', 'on', 'from', 'as']
 let s:quotes = vim_dadbod_completion#schemas#get_quotes_rgx()
 let s:alias_rgx = printf(
-      \ '\(%s\)\?\(\w\+\)\(%s\)\?\(%s\)\@<!\s\+\(as\s\+\)\?\(%s\)\?\(\w\+\)\(%s\)\?',
+      \ '\c\(%s\)\?\(\w\+\)\(%s\)\?\(%s\)\@<!\s\+\(as\s\+\)\?\(%s\)\?\(\w\+\)\(%s\)\?',
       \ s:quotes.open,
       \ s:quotes.close,
       \ join(s:reserved_words, '\|'),
@@ -9,9 +9,9 @@ let s:alias_rgx = printf(
       \ s:quotes.close
       \ )
 
-function! vim_dadbod_completion#alias_parser#parse(bufnr, tables) abort
+function! vim_dadbod_completion#alias_parser#parse(bufnr, tables, ...) abort
   let result = {}
-  let content = getbufline(a:bufnr, 1, '$')
+  let content = a:0 ? a:1 : getbufline(a:bufnr, 1, '$')
   if empty(a:tables) || empty(content)
     return result
   endif
